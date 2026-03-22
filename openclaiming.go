@@ -8,6 +8,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
 	"math/big"
 	"sort"
 
@@ -16,6 +21,68 @@ import (
 
 type ecdsaSignature struct {
 	R, S *big.Int
+}
+
+// ---------- CACHE ----------
+
+var (
+	fetchCache     = map[string]struct{
+		t time.Time
+		data []byte
+	}{}
+	fetchCacheLock sync.Mutex
+	fetchTtl       = 300 * time.Second
+)
+
+func fetchCached(url string) []byte {
+
+	now := time.Now()
+
+	fetchCacheLock.Lock()
+	if entry, ok := fetchCache[url]; ok {
+		if now.Sub(entry.t) < fetchTtl {
+			data := entry.data
+			fetchCacheLock.Unlock()
+			return data
+		}
+	}
+	fetchCacheLock.Unlock()
+
+	var body []byte
+
+	resp, err := http.Get(url)
+	if err == nil && resp != nil {
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			body, _ = io.ReadAll(resp.Body)
+		}
+	}
+
+	fetchCacheLock.Lock()
+	fetchCache[url] = struct{
+		t time.Time
+		data []byte
+	}{now, body}
+	fetchCacheLock.Unlock()
+
+	return body
+}
+
+func ClearFetchCache(url *string) {
+
+	fetchCacheLock.Lock()
+	defer fetchCacheLock.Unlock()
+
+	if url == nil {
+		fetchCache = map[string]struct{
+			t time.Time
+			data []byte
+		}{}
+		return
+	}
+
+	delete(fetchCache, *url)
 }
 
 func normalize(v interface{}) interface{} {
@@ -89,6 +156,66 @@ func Canonicalize(claim map[string]interface{}) ([]byte, error) {
 
 	// Fallback deterministic canonicalization
 	return fallbackCanonicalize(claim)
+}
+
+// ---------- NEW HELPERS ----------
+
+func resolveKey(keyStr string) (string, string, bool) {
+
+	parts := strings.SplitN(keyStr, ":", 2)
+	if len(parts) < 2 {
+		return "", "", false
+	}
+
+	typ := strings.ToUpper(parts[0])
+	rest := parts[1]
+
+	if strings.HasPrefix(rest, "http://") || strings.HasPrefix(rest, "https://") {
+
+		segments := strings.Split(rest, "#")
+		url := segments[0]
+
+		raw := fetchCached(url)
+		if raw == nil {
+			return "", "", false
+		}
+
+		var data interface{}
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return "", "", false
+		}
+
+		current := data
+
+		for i := 1; i < len(segments); i++ {
+
+			key := segments[i]
+			if key == "" {
+				continue
+			}
+
+			m, ok := current.(map[string]interface{})
+			if !ok {
+				return "", "", false
+			}
+
+			current = m[key]
+
+			// OPTIONAL SAFETY: match behavior of other langs
+			if current == nil {
+				return "", "", false
+			}
+		}
+
+		val, ok := current.(string)
+		if !ok {
+			return "", "", false
+		}
+
+		return typ, val, true
+	}
+
+	return typ, rest, true
 }
 
 func Sign(claim map[string]interface{}, priv *ecdsa.PrivateKey) (map[string]interface{}, error) {
